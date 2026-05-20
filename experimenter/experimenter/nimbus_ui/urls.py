@@ -35,6 +35,7 @@ from experimenter.nimbus_ui.views import (
     NewRemoveSubscriberView,
     NewRemoveTagView,
     NewRisksUpdateView,
+    NewRolloutFeaturesUpdateView,
     NewSubscriberSearchView,
     NewTagSearchView,
     NimbusChangeLogsView,
@@ -336,6 +337,11 @@ urlpatterns = [
         r"^new/(?P<slug>[\w-]+)/update_risks/$",
         NewRisksUpdateView.as_view(),
         name="nimbus-ui-new-update-risks",
+    ),
+    re_path(
+        r"^new/(?P<slug>[\w-]+)/update_rollout_features/$",
+        NewRolloutFeaturesUpdateView.as_view(),
+        name="nimbus-ui-new-update-rollout-features",
     ),
     re_path(
         r"^new/(?P<slug>[\w-]+)/create_documentation_link/$",
