@@ -1,4 +1,4 @@
-import datetime as dt
+from pathlib import Path
 
 import markus
 from celery.utils.log import get_task_logger
@@ -11,11 +11,16 @@ from experimenter.experiments.changelog_utils import generate_nimbus_changelog
 from experimenter.experiments.constants import NimbusConstants
 from experimenter.experiments.models import NimbusChangeLog, NimbusExperiment
 from experimenter.jetstream.client import (
+    ERRORS_FOLDER,
+    METADATA_FOLDER,
+    STATISTICS_FOLDER,
+    analysis_storage,
     get_enrollment_funnel_data,
     get_experiment_data,
     get_monitoring_data,
     get_population_sizing_data,
 )
+from experimenter.jetstream.models import AnalysisWindow
 from experimenter.kinto.tasks import get_kinto_user
 
 logger = get_task_logger(__name__)
@@ -41,9 +46,45 @@ def strip_errors(data):
     }
 
 
+RESULTS_FOLDERS = [STATISTICS_FOLDER, METADATA_FOLDER, ERRORS_FOLDER]
+
+
+def get_results_filenames():
+    filenames_by_folder = {}
+    for folder in RESULTS_FOLDERS:
+        _, filenames = analysis_storage.listdir(folder)
+        filenames_by_folder[folder] = set(filenames)
+    return filenames_by_folder
+
+
+def get_latest_results_timestamp(experiment_slug, results_filenames):
+    recipe_slug = experiment_slug.replace("-", "_")
+    expected_filenames = {
+        STATISTICS_FOLDER: [
+            f"statistics_{recipe_slug}_{window}.json" for window in AnalysisWindow
+        ],
+        METADATA_FOLDER: [f"metadata_{recipe_slug}.json"],
+        ERRORS_FOLDER: [f"errors_{recipe_slug}.json"],
+    }
+
+    latest_timestamp = None
+    for folder, filenames in expected_filenames.items():
+        for filename in filenames:
+            if filename not in results_filenames[folder]:
+                continue
+
+            path = Path(folder, filename)
+            file_timestamp = analysis_storage.get_modified_time(str(path))
+
+            if latest_timestamp is None or file_timestamp > latest_timestamp:
+                latest_timestamp = file_timestamp
+
+    return latest_timestamp
+
+
 @app.task
 @metrics.timer_decorator("fetch_experiment_data")
-def fetch_experiment_data(experiment_id):
+def fetch_experiment_data(experiment_id, results_data_updated_at=None):
     metrics.incr("fetch_experiment_data.started")
     experiment = None
     try:
@@ -53,7 +94,6 @@ def fetch_experiment_data(experiment_id):
 
         if old_results_data != new_results_data:
             experiment.results_data = new_results_data
-            experiment.save()
 
             old_normalized = strip_errors(old_results_data)
             new_normalized = strip_errors(new_results_data)
@@ -64,6 +104,12 @@ def fetch_experiment_data(experiment_id):
                     get_kinto_user(),
                     message=NimbusChangeLog.Messages.RESULTS_UPDATED,
                 )
+
+        if results_data_updated_at is not None:
+            experiment.results_data_updated_at = results_data_updated_at
+
+        if old_results_data != new_results_data or results_data_updated_at is not None:
+            experiment.save()
 
         metrics.incr("fetch_experiment_data.completed")
     except Exception as e:
@@ -81,30 +127,30 @@ def fetch_experiment_data(experiment_id):
 def fetch_jetstream_data():
     metrics.incr("fetch_jetstream_data.started")
     try:
+        results_filenames = get_results_filenames()
         for experiment in NimbusExperiment.objects.filter(
             status__in=[NimbusExperiment.Status.COMPLETE, NimbusExperiment.Status.LIVE]
         ):
+            latest_results_timestamp = get_latest_results_timestamp(
+                experiment.slug, results_filenames
+            )
+            if latest_results_timestamp is None:
+                metrics.incr("fetch_jetstream_data.skipped")
+                continue
+
             if (
-                experiment.status == NimbusExperiment.Status.LIVE
-                or experiment.results_data is None
-                or (
-                    experiment.computed_end_date
-                    and (
-                        experiment.computed_end_date
-                        + dt.timedelta(days=NimbusConstants.DAYS_ANALYSIS_BUFFER)
-                    )
-                    >= dt.date.today()
-                )
+                experiment.results_data_updated_at is None
+                or experiment.results_data_updated_at < latest_results_timestamp
             ):
                 logger.info(
                     f"Fetching Jetstream data for {experiment.name} ({experiment.slug})"
                 )
-                fetch_experiment_data.delay(experiment.id)
+                fetch_experiment_data.delay(experiment.id, latest_results_timestamp)
                 metrics.incr("fetch_jetstream_data.completed")
             else:
                 logger.info(
-                    f"Skipping cache refresh for old experiment {experiment.name}"
-                    f" ({experiment.slug})"
+                    f"Skipping cache refresh for experiment {experiment.name}"
+                    f" ({experiment.slug}) because results data is up to date"
                 )
                 metrics.incr("fetch_jetstream_data.skipped")
 
